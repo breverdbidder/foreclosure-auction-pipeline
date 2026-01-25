@@ -1,0 +1,152 @@
+name: AI Council Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform (zonewise, spd, biddeed)'
+        required: true
+        type: choice
+        options:
+          - biddeed
+          - zonewise
+          - spd
+      subject:
+        description: 'Property address or project name'
+        required: true
+        type: string
+      query:
+        description: 'Analysis question'
+        required: true
+        type: string
+      context_json:
+        description: 'JSON context data (optional)'
+        required: false
+        type: string
+        default: '{}'
+
+  repository_dispatch:
+    types: [run-council]
+
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+jobs:
+  run-council:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install langgraph httpx pydantic python-dotenv supabase
+      
+      - name: Run AI Council
+        id: council
+        run: |
+          # Set inputs from workflow_dispatch or repository_dispatch
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            PLATFORM="${{ github.event.client_payload.platform }}"
+            SUBJECT="${{ github.event.client_payload.subject }}"
+            QUERY="${{ github.event.client_payload.query }}"
+            CONTEXT='${{ github.event.client_payload.context }}'
+          else
+            PLATFORM="${{ inputs.platform }}"
+            SUBJECT="${{ inputs.subject }}"
+            QUERY="${{ inputs.query }}"
+            CONTEXT='${{ inputs.context_json }}'
+          fi
+          
+          # Create output directory
+          mkdir -p council_output
+          
+          # Run council analysis
+          python src/council_workflow.py \
+            --platform "$PLATFORM" \
+            --subject "$SUBJECT" \
+            --query "$QUERY" \
+            --context "$CONTEXT" \
+            --output council_output
+          
+          # Set outputs
+          echo "shared_reasoning=$(cat council_output/shared_reasoning.md | base64 -w0)" >> $GITHUB_OUTPUT
+          echo "result=$(cat council_output/council_result.json | base64 -w0)" >> $GITHUB_OUTPUT
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: council-analysis-${{ github.run_id }}
+          path: council_output/
+          retention-days: 30
+      
+      - name: Save to Supabase
+        if: success()
+        run: |
+          python -c "
+          import json
+          import os
+          from supabase import create_client
+          
+          url = os.environ['SUPABASE_URL']
+          key = os.environ['SUPABASE_SERVICE_KEY']
+          
+          if url and key:
+              client = create_client(url, key)
+              
+              with open('council_output/council_result.json') as f:
+                  result = json.load(f)
+              
+              with open('council_output/shared_reasoning.md') as f:
+                  reasoning = f.read()
+              
+              # Insert into council_analyses table
+              client.table('council_analyses').insert({
+                  'council_id': result['council_id'],
+                  'platform': result['platform'],
+                  'subject': result['subject'],
+                  'query': result['query'],
+                  'recommendation': result['recommendation'],
+                  'confidence': result['confidence'],
+                  'action_items': result['action_items'],
+                  'execution_time_ms': result['execution_time_ms'],
+                  'token_usage': result['token_usage'],
+                  'shared_reasoning': reasoning
+              }).execute()
+              
+              print(f'Saved council analysis {result[\"council_id\"]} to Supabase')
+          "
+      
+      - name: Post summary
+        run: |
+          echo "## AI Council Analysis Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse result
+          RESULT=$(cat council_output/council_result.json)
+          CONFIDENCE=$(echo $RESULT | jq -r '.confidence')
+          EXECUTION_TIME=$(echo $RESULT | jq -r '.execution_time_ms')
+          
+          echo "**Platform:** ${{ inputs.platform || github.event.client_payload.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Subject:** ${{ inputs.subject || github.event.client_payload.subject }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Confidence:** ${CONFIDENCE}" >> $GITHUB_STEP_SUMMARY
+          echo "**Execution Time:** ${EXECUTION_TIME}ms" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Action Items" >> $GITHUB_STEP_SUMMARY
+          echo $RESULT | jq -r '.action_items[]' | while read item; do
+            echo "- [ ] $item" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📄 Full analysis available in artifacts" >> $GITHUB_STEP_SUMMARY
