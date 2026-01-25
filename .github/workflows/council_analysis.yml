@@ -52,7 +52,8 @@ jobs:
       
       - name: Install dependencies
         run: |
-          pip install langgraph httpx pydantic python-dotenv supabase
+          pip install langgraph httpx pydantic python-dotenv
+          pip install supabase || true
       
       - name: Run AI Council
         id: council
@@ -73,19 +74,74 @@ jobs:
           # Create output directory
           mkdir -p council_output
           
-          # Run council analysis
-          python src/council_workflow.py \
-            --platform "$PLATFORM" \
-            --subject "$SUBJECT" \
-            --query "$QUERY" \
-            --context "$CONTEXT" \
-            --output council_output
+          # Add src to Python path and run
+          cd $GITHUB_WORKSPACE
+          export PYTHONPATH="${PYTHONPATH}:${GITHUB_WORKSPACE}/src/council"
           
-          # Set outputs
-          echo "shared_reasoning=$(cat council_output/shared_reasoning.md | base64 -w0)" >> $GITHUB_OUTPUT
-          echo "result=$(cat council_output/council_result.json | base64 -w0)" >> $GITHUB_OUTPUT
+          # Run council analysis with inline script to handle imports
+          python3 << PYEOF
+import sys
+import os
+import json
+import asyncio
+from datetime import datetime
+
+# Add council module to path
+sys.path.insert(0, os.path.join(os.getcwd(), 'src', 'council'))
+
+# Import after path setup
+from council_prompts import Platform, get_council_agents, create_shared_reasoning_file
+from council_workflow import run_council
+
+async def main():
+    platform = "$PLATFORM"
+    subject = "$SUBJECT"
+    query = "$QUERY"
+    context = json.loads('$CONTEXT')
+    
+    print(f"Running AI Council for: {subject}")
+    print(f"Platform: {platform}")
+    print(f"Query: {query}")
+    
+    try:
+        result = await run_council(
+            platform=platform,
+            subject=subject,
+            query=query,
+            context=context,
+            output_dir="council_output"
+        )
+        
+        print(f"\n✅ Council Complete!")
+        print(f"Confidence: {result.get('confidence', 0):.2f}")
+        print(f"Execution Time: {result.get('execution_time_ms', 0)}ms")
+        
+    except Exception as e:
+        print(f"❌ Council Error: {e}")
+        # Create minimal output on error
+        error_result = {
+            "council_id": "error",
+            "platform": platform,
+            "subject": subject,
+            "query": query,
+            "error": str(e),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        with open("council_output/council_result.json", "w") as f:
+            json.dump(error_result, f, indent=2)
+        
+        # Create minimal shared_reasoning.md
+        with open("council_output/shared_reasoning.md", "w") as f:
+            f.write(f"# AI Council Analysis: {subject}\n\n")
+            f.write(f"**Error:** {e}\n")
+        
+        raise
+
+asyncio.run(main())
+PYEOF
       
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: council-analysis-${{ github.run_id }}
@@ -94,59 +150,69 @@ jobs:
       
       - name: Save to Supabase
         if: success()
+        continue-on-error: true
         run: |
-          python -c "
-          import json
-          import os
-          from supabase import create_client
-          
-          url = os.environ['SUPABASE_URL']
-          key = os.environ['SUPABASE_SERVICE_KEY']
-          
-          if url and key:
-              client = create_client(url, key)
-              
-              with open('council_output/council_result.json') as f:
-                  result = json.load(f)
-              
-              with open('council_output/shared_reasoning.md') as f:
-                  reasoning = f.read()
-              
-              # Insert into council_analyses table
-              client.table('council_analyses').insert({
-                  'council_id': result['council_id'],
-                  'platform': result['platform'],
-                  'subject': result['subject'],
-                  'query': result['query'],
-                  'recommendation': result['recommendation'],
-                  'confidence': result['confidence'],
-                  'action_items': result['action_items'],
-                  'execution_time_ms': result['execution_time_ms'],
-                  'token_usage': result['token_usage'],
-                  'shared_reasoning': reasoning
-              }).execute()
-              
-              print(f'Saved council analysis {result[\"council_id\"]} to Supabase')
-          "
+          python3 << 'PYEOF'
+import json
+import os
+
+try:
+    from supabase import create_client
+    
+    url = os.environ.get('SUPABASE_URL', '')
+    key = os.environ.get('SUPABASE_SERVICE_KEY', '')
+    
+    if url and key:
+        client = create_client(url, key)
+        
+        with open('council_output/council_result.json') as f:
+            result = json.load(f)
+        
+        with open('council_output/shared_reasoning.md') as f:
+            reasoning = f.read()
+        
+        # Insert into council_analyses table
+        client.table('council_analyses').insert({
+            'council_id': result.get('council_id', 'unknown'),
+            'platform': result.get('platform', ''),
+            'subject': result.get('subject', ''),
+            'query': result.get('query', ''),
+            'recommendation': result.get('recommendation', ''),
+            'confidence': result.get('confidence', 0),
+            'action_items': result.get('action_items', []),
+            'execution_time_ms': result.get('execution_time_ms', 0),
+            'token_usage': result.get('token_usage', {}),
+            'shared_reasoning': reasoning
+        }).execute()
+        
+        print(f"✅ Saved council analysis to Supabase")
+    else:
+        print("⚠️ Supabase credentials not configured")
+        
+except ImportError:
+    print("⚠️ Supabase client not installed")
+except Exception as e:
+    print(f"⚠️ Failed to save to Supabase: {e}")
+PYEOF
       
       - name: Post summary
+        if: always()
         run: |
           echo "## AI Council Analysis Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Parse result
-          RESULT=$(cat council_output/council_result.json)
-          CONFIDENCE=$(echo $RESULT | jq -r '.confidence')
-          EXECUTION_TIME=$(echo $RESULT | jq -r '.execution_time_ms')
+          if [ -f council_output/council_result.json ]; then
+            RESULT=$(cat council_output/council_result.json)
+            CONFIDENCE=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin).get('confidence', 'N/A'))" 2>/dev/null || echo "N/A")
+            EXECUTION_TIME=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin).get('execution_time_ms', 'N/A'))" 2>/dev/null || echo "N/A")
+            
+            echo "**Platform:** ${{ inputs.platform || github.event.client_payload.platform }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Subject:** ${{ inputs.subject || github.event.client_payload.subject }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Confidence:** ${CONFIDENCE}" >> $GITHUB_STEP_SUMMARY
+            echo "**Execution Time:** ${EXECUTION_TIME}ms" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ No result file generated" >> $GITHUB_STEP_SUMMARY
+          fi
           
-          echo "**Platform:** ${{ inputs.platform || github.event.client_payload.platform }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Subject:** ${{ inputs.subject || github.event.client_payload.subject }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Confidence:** ${CONFIDENCE}" >> $GITHUB_STEP_SUMMARY
-          echo "**Execution Time:** ${EXECUTION_TIME}ms" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Action Items" >> $GITHUB_STEP_SUMMARY
-          echo $RESULT | jq -r '.action_items[]' | while read item; do
-            echo "- [ ] $item" >> $GITHUB_STEP_SUMMARY
-          done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "📄 Full analysis available in artifacts" >> $GITHUB_STEP_SUMMARY
