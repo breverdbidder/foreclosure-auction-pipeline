@@ -129,7 +129,7 @@ The pipeline generates two JSON files in the output directory:
 ## Data Sources
 
 ### Brevard County Clerk
-- **URL**: http://vweb2.brevardclerk.us/Foreclosures/foreclosure_sales.html
+- **URL**: http://www.brevardclerk.us/Foreclosures/foreclosure_sales.html
 - **Data**: Foreclosure auction listings, case numbers, auction dates, status
 - **Method**: HTML scraping with BeautifulSoup
 
