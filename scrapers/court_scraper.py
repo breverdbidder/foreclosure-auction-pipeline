@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class CourtRecordsScraper:
     """Scrapes foreclosure auction records from Brevard County Clerk"""
     
-    BASE_URL = "http://vweb2.brevardclerk.us/Foreclosures/foreclosure_sales.html"
+    BASE_URL = "http://www.brevardclerk.us/Foreclosures/foreclosure_sales.html"
     
     def __init__(self):
         self.client = httpx.Client(
